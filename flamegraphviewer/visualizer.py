@@ -1,17 +1,26 @@
 import calendar
-import click
 import dateparser
-from flask import Flask, request, jsonify, render_template
-from collector import getdb
+import json
+import logging
+import os
+import six
+try:
+    from lz4.block import decompress
+except ImportError:
+    try:
+        from lz4 import decompress
+    except ImportError:
+        def decompress(data):
+            return data
 
+from flask import Flask, request, jsonify, render_template
+from flamegraphviewer.backends import get_db
 
 app = Flask(__name__)
 app.config['DEBUG'] = True
 
-
 def _parse_relative_date(datestr):
     return calendar.timegm(dateparser.parse(datestr).utctimetuple())
-
 
 class Node(object):
     def __init__(self, name):
@@ -54,8 +63,16 @@ class Node(object):
             return
         self.add(frames, value)
 
+@app.route('/keys')
+def keys():
+    key_filter = request.args.get('filter', None)
+    if not key_filter:
+        key_filter='*'
+    with get_db(app.config['DB_URL']) as db:
+        keys = [key.decode('utf-8') for key in db.scan_iter(key_filter)]
+        return jsonify(keys)
 
-@app.route('/data')
+@app.route('/data', methods=['GET', 'POST'])
 def data():
     from_ = request.args.get('from')
     if from_ is not None:
@@ -64,21 +81,19 @@ def data():
     if until is not None:
         until = _parse_relative_date(until)
     threshold = float(request.args.get('threshold', 0))
+    try:
+        request_data = json.load(six.BytesIO(request.data))
+    except json.decoder.JSONDecodeError:
+        request_data = {}
+
     root = Node('root')
-    with getdb(app.config['DBPATH']) as db:
-        keys = db.keys()
-        for k in keys:
-            entries = db[k].split()
-            value = 0
-            for e in entries:
-                host, port, ts, v = e.split(':')
-                ts = int(ts)
-                v = int(v)
-                if ((from_ is None or ts >= from_) and
-                        (until is None or ts <= until)):
-                    value += v
-            frames = k.split(';')
-            root.add(frames, value)
+    with get_db(app.config['DB_URL']) as db:
+        for key in request_data.get('keys', []):
+            for el in db.zrangebyscore(key, '-inf', '+inf'):
+                with six.StringIO(decompress(el).decode()) as data:
+                    for line in data:
+                        root.add_raw(line)
+
     return jsonify(root.serialize(threshold * root.value))
 
 
@@ -87,12 +102,9 @@ def render():
     return app.send_static_file('index.html')
 
 
-@click.command()
-@click.option('--port', type=int, default=9999)
-@click.option('--dbpath', '-d', default='/var/lib/stackcollector/db')
-def run(port, dbpath):
-    app.config['DBPATH'] = dbpath
+def run(port, db_url):
+    app.config['DB_URL'] = db_url
     app.run(host='0.0.0.0', port=port)
 
 if __name__ == '__main__':
-    run()
+    run(int(os.getenv('PORT', 9999)),  str(os.getenv('DB_URL', '')))
